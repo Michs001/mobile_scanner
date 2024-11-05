@@ -1,12 +1,16 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:mobile_scanner/src/mobile_scanner_controller.dart';
 import 'package:mobile_scanner/src/mobile_scanner_exception.dart';
 import 'package:mobile_scanner/src/mobile_scanner_platform_interface.dart';
 import 'package:mobile_scanner/src/objects/barcode_capture.dart';
 import 'package:mobile_scanner/src/objects/mobile_scanner_state.dart';
 import 'package:mobile_scanner/src/scan_window_calculation.dart';
+
+import '../mobile_scanner.dart';
 
 /// The function signature for the error builder.
 typedef MobileScannerErrorBuilder = Widget Function(
@@ -28,6 +32,8 @@ class MobileScanner extends StatefulWidget {
     this.placeholderBuilder,
     this.scanWindow,
     this.scanWindowUpdateThreshold = 0.0,
+    this.startDelay = false,
+    this.overlay,
     super.key,
   });
 
@@ -123,6 +129,16 @@ class MobileScanner extends StatefulWidget {
   /// Defaults to no threshold for scan window updates.
   final double scanWindowUpdateThreshold;
 
+  /// Only set this to true if you are starting another instance of mobile_scanner
+  /// right after disposing the first one, like in a PageView.
+  ///
+  /// Default: false
+  final bool startDelay;
+
+  /// The overlay which will be painted above the scanner when has started successful.
+  /// Will no be pointed when an error occurs or the scanner hasn't been started yet.
+  final Widget? overlay;
+
   @override
   State<MobileScanner> createState() => _MobileScannerState();
 
@@ -134,7 +150,8 @@ class MobileScanner extends StatefulWidget {
 
 class _MobileScannerState extends State<MobileScanner>
     with WidgetsBindingObserver {
-  late final controller = widget.controller ?? MobileScannerController();
+  late var controller = widget.controller ?? MobileScannerController();
+  StreamSubscription<BarcodeCapture>? _barcodesSubscription;
 
   /// The current scan window.
   Rect? scanWindow;
@@ -198,15 +215,19 @@ class _MobileScannerState extends State<MobileScanner>
   Widget build(BuildContext context) {
     return ValueListenableBuilder<MobileScannerState>(
       valueListenable: controller,
-      builder: (BuildContext context, MobileScannerState value, Widget? child) {
-        if (!value.isInitialized) {
+      builder: (BuildContext context, MobileScannerState? value, Widget? child) {
+        if (value != null && !value.isInitialized) {
           const Widget defaultPlaceholder = ColoredBox(color: Colors.black);
 
           return widget.placeholderBuilder?.call(context, child) ??
               defaultPlaceholder;
         }
 
-        final MobileScannerException? error = value.error;
+        if (value == null) {
+          return _buildPlaceholderOrError(context, child);
+        }
+
+        /*final MobileScannerException? error = value.error;
 
         if (error != null) {
           const Widget defaultError = ColoredBox(
@@ -216,14 +237,23 @@ class _MobileScannerState extends State<MobileScanner>
 
           return widget.errorBuilder?.call(context, error, child) ??
               defaultError;
-        }
+        }*/
 
         return LayoutBuilder(
           builder: (context, constraints) {
+
+            if (widget.scanWindow != null && scanWindow == null) {
+              scanWindow = calculateScanWindowRelativeToTextureInPercentage(
+                widget.fit,
+                widget.scanWindow!,
+                textureSize: value.size,
+                widgetSize: constraints.biggest,
+              );
+
+              controller.updateScanWindow(scanWindow);
+            }
             _maybeUpdateScanWindow(value, constraints);
 
-            final Widget? overlay =
-                widget.overlayBuilder?.call(context, constraints);
             final Size cameraPreviewSize = value.size;
 
             final Widget scannerWidget = ClipRect(
@@ -240,17 +270,17 @@ class _MobileScannerState extends State<MobileScanner>
               ),
             );
 
-            if (overlay == null) {
+            if (widget.overlay != null) {
+              return Stack(
+                alignment: Alignment.center,
+                children: [
+                  scannerWidget,
+                  widget.overlay!,
+                ],
+              );
+            } else {
               return scannerWidget;
             }
-
-            return Stack(
-              alignment: Alignment.center,
-              children: <Widget>[
-                scannerWidget,
-                overlay,
-              ],
-            );
           },
         );
       },
@@ -258,21 +288,78 @@ class _MobileScannerState extends State<MobileScanner>
   }
 
   StreamSubscription? _subscription;
+  MobileScannerException? _startException;
 
   @override
   void initState() {
-    if (widget.onDetect != null) {
-      WidgetsBinding.instance.addObserver(this);
-      _subscription = controller.barcodes.listen(
-        widget.onDetect,
-        onError: widget.onDetectError,
-        cancelOnError: false,
-      );
-    }
-    if (controller.autoStart) {
-      controller.start();
-    }
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    controller = widget.controller ?? MobileScannerController();
+    _startScanner();
+  }
+
+  Future<void> _startScanner() async {
+    if (widget.startDelay) {
+      await Future.delayed(const Duration(seconds: 1, milliseconds: 500));
+    }
+
+    _barcodesSubscription ??= controller.barcodes.listen(
+      widget.onDetect,
+    );
+
+    if (!controller.autoStart) {
+      debugPrint(
+        'mobile_scanner: not starting automatically because autoStart is set to false in the controller.',
+      );
+      return;
+    }
+
+    controller.start().then((arguments) {
+      // ignore: deprecated_member_use_from_same_package
+      //widget.onStart?.call(arguments);
+      //widget.onScannerStarted?.call(arguments);
+    }).catchError((error) {
+      if (!mounted) {
+        return;
+      }
+
+      if (error is MobileScannerException) {
+        _startException = error;
+      } else if (error is PlatformException) {
+        _startException = MobileScannerException(
+          errorCode: MobileScannerErrorCode.genericError,
+          errorDetails: MobileScannerErrorDetails(
+            code: error.code,
+            message: error.message,
+            details: error.details,
+          ),
+        );
+      } else {
+        _startException = MobileScannerException(
+          errorCode: MobileScannerErrorCode.genericError,
+          errorDetails: MobileScannerErrorDetails(
+            details: error,
+          ),
+        );
+      }
+
+      setState(() {});
+    });
+  }
+
+  Widget _buildPlaceholderOrError(BuildContext context, Widget? child) {
+    final error = _startException;
+
+    if (error != null) {
+      return widget.errorBuilder?.call(context, error, child) ??
+          const ColoredBox(
+            color: Colors.black,
+            child: Center(child: Icon(Icons.error, color: Colors.white)),
+          );
+    }
+
+    return widget.placeholderBuilder?.call(context, child) ??
+        const ColoredBox(color: Colors.black);
   }
 
   @override
